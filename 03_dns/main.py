@@ -16,6 +16,15 @@ def require(condition, message="malformed DNS message"):
         raise ValueError(message)
 
 
+class IncompleteMessage(ValueError):
+    """В сообщении не хватает байтов для очередного поля."""
+
+
+def require_complete(condition):
+    if not condition:
+        raise IncompleteMessage("incomplete DNS message")
+
+
 def encode_name(name):
     if name == ".":
         return b"\x00"
@@ -36,11 +45,12 @@ def read_name(message, offset):
     end = None
     expanded_length = 1
     while True:
-        require(0 <= offset < len(message) and offset not in visited)
+        require_complete(0 <= offset < len(message))
+        require(offset not in visited)
         visited.add(offset)
         length = message[offset]
         if length & 0xC0 == 0xC0:
-            require(offset + 1 < len(message))
+            require_complete(offset + 1 < len(message))
             if end is None:
                 end = offset + 2
             offset = ((length & 0x3F) << 8) | message[offset + 1]
@@ -49,7 +59,7 @@ def read_name(message, offset):
         offset += 1
         if length == 0:
             return ".".join(labels) + ".", end if end is not None else offset
-        require(offset + length <= len(message))
+        require_complete(offset + length <= len(message))
         expanded_length += length + 1
         require(expanded_length <= 255)
         labels.append(message[offset:offset + length].decode("ascii"))
@@ -89,28 +99,32 @@ def parse_response(message):
     require(len(message) >= 12)
     _, flags, qd, an, ns, ar = struct.unpack_from("!6H", message)
     require(flags & 0x8000 and not flags & 0x7800, "not a DNS query response")
-    require(not flags & 0x0200, "truncated DNS response")
+    truncated = bool(flags & 0x0200)
     rcode = flags & 15
-    offset = 12
-    for _ in range(qd):
-        _, offset = read_name(message, offset)
-        require(offset + 4 <= len(message))
-        offset += 4
     answers, lifetimes = [], []
-    for index in range(an + ns + ar):
-        _, offset = read_name(message, offset)
-        require(offset + 10 <= len(message))
-        rtype, rclass, ttl, length = struct.unpack_from("!HHIH", message, offset)
-        start = offset + 10
-        offset = start + length
-        require(offset <= len(message))
-        if index < an:
-            lifetimes.append(ttl)
-            if rtype in TYPE_NAMES and rclass == 1:
-                value = record_value(message, rtype, start, offset)
-                answers.append("%s %s %d" % (TYPE_NAMES[rtype], value, ttl))
+    try:
+        offset = 12
+        for _ in range(qd):
+            _, offset = read_name(message, offset)
+            require_complete(offset + 4 <= len(message))
+            offset += 4
+        for index in range(an + ns + ar):
+            _, offset = read_name(message, offset)
+            require_complete(offset + 10 <= len(message))
+            rtype, rclass, ttl, length = struct.unpack_from("!HHIH", message, offset)
+            start = offset + 10
+            offset = start + length
+            require_complete(offset <= len(message))
+            if index < an:
+                lifetimes.append(ttl)
+                if rtype in TYPE_NAMES and rclass == 1:
+                    value = record_value(message, rtype, start, offset)
+                    answers.append("%s %s %d" % (TYPE_NAMES[rtype], value, ttl))
+    except IncompleteMessage:
+        if not truncated:
+            raise
     status = STATUSES.get(rcode, "RCODE%d" % rcode)
-    ttl = min(lifetimes) if lifetimes and rcode == 0 else 0
+    ttl = min(lifetimes) if lifetimes and rcode == 0 and not truncated else 0
     return status, answers, ttl
 
 
